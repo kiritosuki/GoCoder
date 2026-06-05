@@ -119,8 +119,20 @@ func (a *Agent) Run(userInput string) (string, error) {
 
 // Resume 从已有的消息历史恢复执行
 func (a *Agent) Resume(messages []types.Message) (string, error) {
-	a.messages = messages
+	a.SetMessages(messages)
 	return a.agentLoop()
+}
+
+// SetMessages 恢复消息历史但不触发 LLM 调用。TUI 的 /resume 使用这个方法，
+// 恢复后等待用户下一次输入再继续 agent loop。
+func (a *Agent) SetMessages(messages []types.Message) {
+	restored := make([]types.Message, 0, len(messages)+1)
+	if a.systemPrompt != "" && (len(messages) == 0 || messages[0].Role != "system") {
+		restored = append(restored, types.Message{Role: "system", Content: a.systemPrompt})
+	}
+	restored = append(restored, messages...)
+	a.messages = restored
+	a.updateTokenEstimate()
 }
 
 // ──── Agent Loop 核心 ────

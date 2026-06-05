@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/kiritosuki/gocoder/config"
@@ -69,8 +71,7 @@ func Open(path string) (*Session, error) {
 		return nil, fmt.Errorf("打开会话文件失败: %w", err)
 	}
 
-	id := filepath.Base(path)
-	id = id[8 : len(id)-6] // strip prefix and suffix
+	id := SessionIDFromPath(path)
 
 	return &Session{
 		path:   path,
@@ -290,7 +291,42 @@ func ListSessions() ([]string, error) {
 			sessions = append(sessions, filepath.Join(dir, e.Name()))
 		}
 	}
+	sort.Sort(sort.Reverse(sort.StringSlice(sessions)))
 	return sessions, nil
+}
+
+// ResolveSessionPath accepts either a full/relative path, a raw session id
+// like 20260605_211500, or a filename like session_20260605_211500.jsonl.
+func ResolveSessionPath(ref string) (string, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", fmt.Errorf("缺少 session id 或路径")
+	}
+	if strings.ContainsRune(ref, filepath.Separator) || filepath.Ext(ref) == ".jsonl" {
+		if !filepath.IsAbs(ref) {
+			abs, err := filepath.Abs(ref)
+			if err != nil {
+				return "", err
+			}
+			ref = abs
+		}
+		return ref, nil
+	}
+
+	dir, err := config.SessionsDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, fmt.Sprintf("session_%s.jsonl", ref)), nil
+}
+
+func SessionIDFromPath(path string) string {
+	base := filepath.Base(path)
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+	if strings.HasPrefix(base, "session_") {
+		return strings.TrimPrefix(base, "session_")
+	}
+	return base
 }
 
 func strVal(m map[string]any, key string) string {

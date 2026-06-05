@@ -54,7 +54,7 @@ gocoder version         # 版本信息
 | Enter | 发送消息 |
 | Ctrl+S | 保存会话 |
 | Ctrl+C/D | 退出 |
-| A/D/Y/N | 权限审批（Allow/Deny/Yes-all/No-all）|
+| A/D | 权限审批（Allow/Deny）|
 
 ### 内置命令
 
@@ -62,7 +62,8 @@ gocoder version         # 版本信息
 |------|------|
 | `/help` | 显示帮助 |
 | `/save` | 保存当前会话 |
-| `/resume <id>` | 恢复会话 |
+| `/resume` | 列出最近会话 |
+| `/resume <id\|path>` | 恢复指定会话 |
 | `/skill <name>` | 激活 Skill |
 | `/models` | 列出模型 |
 | `/tokens` | Token 用量 |

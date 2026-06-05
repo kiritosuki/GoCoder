@@ -251,6 +251,9 @@ GoCoder 用 JSONL 保存事件：
 - assistant 里的 tool_calls 保存为 tool_call event。
 - tool result 保存为 tool_result event。
 - 恢复时再组装回 OpenAI messages。
+- `/save` 会把当前 agent messages 追加写入 `~/.gocoder/sessions/session_<id>.jsonl`。
+- `/resume` 不带参数会列出最近会话。
+- `/resume <id|path>` 会加载 JSONL，恢复 messages 和聊天展示，但不会立刻调用模型；恢复后等用户下一次输入再继续。
 
 面试时可以说：
 

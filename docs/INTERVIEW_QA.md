@@ -275,6 +275,8 @@ GoCoder 有两类记忆：
 
 长期/可恢复记忆是 session JSONL trace，包括用户消息、assistant 消息、tool_call、tool_result、permission、compact 等事件。
 
+用户可以用 `/save` 保存当前会话，用 `/resume` 列出最近会话，用 `/resume <id|path>` 恢复指定会话。恢复时不会立刻让模型继续生成，而是先恢复上下文，等用户下一次输入后再继续 agent loop。
+
 MCP memory server 也可以作为外部记忆接入，但它属于扩展能力，不是 GoCoder 内部必需依赖。
 
 ## 21. 为什么 session 用 JSONL？
@@ -286,6 +288,8 @@ JSONL 很适合事件流：
 - 程序崩溃时已经写入的事件不会丢。
 - 方便 replay。
 - 不需要一次性把整个会话序列化成大 JSON。
+
+GoCoder 恢复时会把 JSONL 事件重新转换成 OpenAI messages，尤其会保留 assistant 的 tool_call 和对应 tool_result，而不是只恢复聊天文本。
 
 ## 22. 这个项目和普通 ChatGPT wrapper 有什么区别？
 

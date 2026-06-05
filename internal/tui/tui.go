@@ -4,6 +4,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -458,9 +459,14 @@ func (m *model) handleCommand(input string) tea.Cmd {
 
 	switch parts[0] {
 	case "/help":
-		m.addToHistory("命令: /help /save /skill /models /tokens /mcp")
+		m.addToHistory(helpText())
 	case "/save":
 		return m.saveSession()
+	case "/resume":
+		if len(parts) == 1 {
+			return m.listSessions()
+		}
+		return m.resumeSession(parts[1])
 	case "/skill":
 		if len(parts) > 1 {
 			if skill, err := m.skillMgr.Activate(parts[1]); err == nil {
@@ -513,6 +519,133 @@ func (m *model) saveSession() tea.Cmd {
 		m.addToHistory("✓ 会话已保存: " + m.session.ID())
 		return nil
 	}
+}
+
+func (m *model) listSessions() tea.Cmd {
+	return func() tea.Msg {
+		paths, err := session.ListSessions()
+		if err != nil {
+			m.errorMsg = err.Error()
+			return nil
+		}
+		if len(paths) == 0 {
+			m.addToHistory("暂无已保存会话。使用 /save 保存当前会话。")
+			return nil
+		}
+		var sb strings.Builder
+		sb.WriteString("可恢复会话:\n")
+		limit := min(len(paths), 10)
+		for i := 0; i < limit; i++ {
+			id := session.SessionIDFromPath(paths[i])
+			sb.WriteString(fmt.Sprintf("- %s  (%s)\n", id, shortPath(paths[i])))
+		}
+		sb.WriteString("使用 /resume <id> 恢复，例如 /resume ")
+		sb.WriteString(session.SessionIDFromPath(paths[0]))
+		m.addToHistory(sb.String())
+		return nil
+	}
+}
+
+func (m *model) resumeSession(ref string) tea.Cmd {
+	return func() tea.Msg {
+		path, err := session.ResolveSessionPath(ref)
+		if err != nil {
+			m.errorMsg = err.Error()
+			return nil
+		}
+		events, err := session.LoadEvents(path)
+		if err != nil {
+			m.errorMsg = err.Error()
+			return nil
+		}
+		msgs := session.EventsToMessages(events)
+		m.agent.SetMessages(msgs)
+
+		if m.session != nil {
+			_ = m.session.Close()
+		}
+		s, err := session.Open(path)
+		if err != nil {
+			m.errorMsg = err.Error()
+			return nil
+		}
+		m.session = s
+		m.savedMessages = len(m.agent.Messages())
+		m.chatHistory = renderRestoredMessages(m.mdRenderer, msgs)
+		m.addToHistory(fmt.Sprintf("✓ 已恢复会话: %s (%d messages)", session.SessionIDFromPath(path), len(msgs)))
+		m.scrollOffset = 0
+		return nil
+	}
+}
+
+func renderRestoredMessages(renderer *glamour.TermRenderer, msgs []types.Message) string {
+	var sb strings.Builder
+	for _, msg := range msgs {
+		switch msg.Role {
+		case "user":
+			sb.WriteString(UserMsgStyle.Render("> " + msg.Content))
+			sb.WriteString("\n")
+		case "assistant":
+			if msg.Content != "" {
+				content := msg.Content
+				if renderer != nil {
+					if rendered, err := renderer.Render(msg.Content); err == nil {
+						content = rendered
+					}
+				}
+				sb.WriteString(content)
+				if !strings.HasSuffix(content, "\n") {
+					sb.WriteString("\n")
+				}
+			}
+			for _, tc := range msg.ToolCalls {
+				sb.WriteString(ToolExecutingStyle.Render(fmt.Sprintf("↳ tool call: %s %s", tc.Function.Name, tc.Function.Arguments)))
+				sb.WriteString("\n")
+			}
+		case "tool":
+			name := msg.Name
+			if name == "" {
+				name = msg.ToolCallID
+			}
+			preview := msg.Content
+			if len(preview) > 500 {
+				preview = preview[:500] + "\n...[truncated in restored view]..."
+			}
+			sb.WriteString(SystemMsgStyle.Render(fmt.Sprintf("↳ tool result: %s", name)))
+			sb.WriteString("\n")
+			sb.WriteString(preview)
+			if !strings.HasSuffix(preview, "\n") {
+				sb.WriteString("\n")
+			}
+		}
+	}
+	return sb.String()
+}
+
+func helpText() string {
+	return strings.Join([]string{
+		"命令:",
+		"  /help              显示帮助",
+		"  /save              保存当前会话到 ~/.gocoder/sessions",
+		"  /resume            列出最近会话",
+		"  /resume <id|path>  恢复指定会话",
+		"  /skill             列出可用 skills",
+		"  /skill <name>      激活 skill",
+		"  /models            显示当前模型配置",
+		"  /tokens            显示 token 估算",
+		"  /mcp               显示 MCP 连接状态",
+		"",
+		"快捷键: Enter 发送 · Ctrl+S 保存 · Ctrl+C 退出 · PgUp/PgDn 滚动",
+	}, "\n")
+}
+
+func shortPath(path string) string {
+	if home, err := os.UserHomeDir(); err == nil {
+		if rel, err := filepath.Rel(home, path); err == nil && !strings.HasPrefix(rel, "..") {
+			return "~/" + rel
+		}
+	}
+	return path
 }
 
 // ──── MCP ────

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/kiritosuki/gocoder/internal/types"
@@ -54,5 +55,22 @@ func TestAppendAgentMessagePreservesToolRound(t *testing.T) {
 	}
 	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "call_1" || msgs[2].Name != "read_file" {
 		t.Fatalf("tool result not restored: %+v", msgs[2])
+	}
+}
+
+func TestResolveSessionPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	path, err := ResolveSessionPath("20260605_211500")
+	if err != nil {
+		t.Fatalf("resolve id: %v", err)
+	}
+	wantSuffix := "session_20260605_211500.jsonl"
+	if filepath.Base(path) != wantSuffix {
+		t.Fatalf("expected %s, got %s", wantSuffix, path)
+	}
+	if SessionIDFromPath(path) != "20260605_211500" {
+		t.Fatalf("unexpected session id: %s", SessionIDFromPath(path))
 	}
 }
