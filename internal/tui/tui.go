@@ -50,6 +50,11 @@ type agentDoneMsg struct {
 // notifyMsg 系统通知（MCP 连接等），直接追加到聊天记录
 type notifyMsg struct{ text string }
 
+type permissionRequestMsg struct {
+	req  types.PermissionRequest
+	resp chan types.PermissionDecision
+}
+
 // ──── Model ────
 
 type model struct {
@@ -67,12 +72,13 @@ type model struct {
 	mdRenderer *glamour.TermRenderer
 	program    *tea.Program
 
-	state       State
-	chatHistory string // 完整对话历史
-	streamBuf   string // 流式增量（打字机效果）
-	toolStatus  string
-	errorMsg    string
-	pendingPerm *types.PermissionRequest
+	state        State
+	chatHistory  string // 完整对话历史
+	streamBuf    string // 流式增量（打字机效果）
+	toolStatus   string
+	errorMsg     string
+	pendingPerm  *types.PermissionRequest
+	permDecision chan types.PermissionDecision
 
 	scrollOffset int
 	maxScroll    int
@@ -173,6 +179,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case notifyMsg:
 		m.addToHistory(SystemMsgStyle.Render(msg.text))
 		return m, nil
+	case permissionRequestMsg:
+		m.pendingPerm = &msg.req
+		m.permDecision = msg.resp
+		m.state = stateAwaitingPermission
+		return m, nil
 	}
 
 	switch m.state {
@@ -264,8 +275,7 @@ func (m *model) buildBottom() string {
 	var sb strings.Builder
 
 	if m.state == stateAwaitingPermission && m.pendingPerm != nil {
-		sb.WriteString(PermissionStyle.Render(
-			fmt.Sprintf("⚠ %s [A]llow [D]eny", m.pendingPerm.Description)))
+		sb.WriteString(PermissionStyle.Render(formatPermissionPrompt(m.pendingPerm)))
 		sb.WriteString("\n")
 	}
 
@@ -313,8 +323,19 @@ func (m *model) executingUpdate(msg tea.Msg) tea.Cmd {
 func (m *model) permissionUpdate(msg tea.Msg) tea.Cmd {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch strings.ToLower(keyMsg.String()) {
-		case "a", "d":
+		case "a":
+			if m.permDecision != nil {
+				m.permDecision <- types.PermAllow
+			}
 			m.pendingPerm = nil
+			m.permDecision = nil
+			m.state = stateStreaming
+		case "d":
+			if m.permDecision != nil {
+				m.permDecision <- types.PermDeny
+			}
+			m.pendingPerm = nil
+			m.permDecision = nil
 			m.state = stateStreaming
 		}
 	}
@@ -396,7 +417,9 @@ func (m *model) runAgent(input string) tea.Cmd {
 				if req.RiskLevel == "readonly" {
 					return types.PermAllow
 				}
-				return types.PermAllow
+				resp := make(chan types.PermissionDecision, 1)
+				p.Send(permissionRequestMsg{req: req, resp: resp})
+				return <-resp
 			},
 		)
 		content, err := m.agent.Run(input)
@@ -639,6 +662,31 @@ func helpText() string {
 	}, "\n")
 }
 
+func formatPermissionPrompt(req *types.PermissionRequest) string {
+	var sb strings.Builder
+	sb.WriteString("⚠ ")
+	sb.WriteString(req.Description)
+	if req.RiskLevel != "" {
+		sb.WriteString(" [")
+		sb.WriteString(req.RiskLevel)
+		sb.WriteString("]")
+	}
+	if req.Command != "" {
+		sb.WriteString("\n$ ")
+		sb.WriteString(req.Command)
+	}
+	if req.Diff != "" {
+		diff := req.Diff
+		if len(diff) > 1200 {
+			diff = diff[:1200] + "\n...[diff truncated]..."
+		}
+		sb.WriteString("\n")
+		sb.WriteString(diff)
+	}
+	sb.WriteString("\n[A]llow [D]eny")
+	return sb.String()
+}
+
 func shortPath(path string) string {
 	if home, err := os.UserHomeDir(); err == nil {
 		if rel, err := filepath.Rel(home, path); err == nil && !strings.HasPrefix(rel, "..") {
@@ -690,6 +738,13 @@ func (m *model) connectMCPServers() tea.Cmd {
 }
 
 func (m *model) cleanup() {
+	if m.permDecision != nil {
+		select {
+		case m.permDecision <- types.PermDeny:
+		default:
+		}
+		m.permDecision = nil
+	}
 	if m.session != nil {
 		m.session.Close()
 	}

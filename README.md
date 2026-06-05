@@ -140,6 +140,7 @@ description: Go 项目发布流程。当用户提到"发布"、"release"时使�
 
 - [项目阅读指南](docs/PROJECT_GUIDE.md) — 按核心模块讲解 Agent Loop、Tools、MCP、Skills、Session、Compact。
 - [面试 QA](docs/INTERVIEW_QA.md) — 用面试官问答形式准备项目介绍、亮点、设计取舍和关键概念。
+- [保姆级教学](docs/BABY_GUIDE.md) — 超级详细的教学文档，面向小白。
 
 ## License
 
