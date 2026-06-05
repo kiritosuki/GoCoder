@@ -1,0 +1,30 @@
+# Go build/test artifacts
+/gocoder
+/GoCoder
+*.test
+*.out
+coverage.out
+
+# Local runtime data
+/.gocoder/
+/.playwright-mcp/
+/tool_results/
+/sessions/
+
+# User/editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Env files
+.env
+.env.*
+
+# Dependency/cache directories
+node_modules/
+vendor/

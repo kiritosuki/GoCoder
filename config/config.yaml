@@ -1,0 +1,19 @@
+# GoCoder 配置文件 (~/.gocoder/config.yaml)
+
+preferences:
+  max_tool_rounds: 15
+  compact_threshold: 0.7
+  project_dir: .
+
+model:
+  name: gpt-4o
+  endpoint: https://api.openai.com/v1/chat/completions
+  auth_env_var: GOCODER_API_KEY
+  max_tokens: 128000
+
+mcp_servers: {}
+  # playwright:
+  #   command: npx
+  #   args: ["-y", "@playwright/mcp@latest"]
+
+config_format_version: "2"
