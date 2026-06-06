@@ -7,7 +7,7 @@
 - **Agent 循环引擎** — 多轮 Tool Calling 自动调度，tool_call+result 原子语义单元
 - **分级上下文压缩** — Snip(确定性裁剪) + Model Compact(LLM 摘要) + Context Collapse(投影)，三级非破坏性降级
 - **Token 感知调度** — Provider usage 优先，多级估算降级，自动触发 compact
-- **Event Sourcing 会话** — JSONL 追加式事件流，支持 fork/resume/replay
+- **Event Sourcing 会话** — JSONL 追加式事件流，支持保存、恢复和执行轨迹追踪
 - **MCP 协议接入** — JSON-RPC 2.0 Client，stdio/HTTP 双模式，动态工具注册
 - **Skills 流程知识** — SKILL.md 注入，分离"可执行能力"和"流程知识"
 - **权限审批框架** — 分级审批(自动/白名单/确认)，文件 diff 预览，shell 审查

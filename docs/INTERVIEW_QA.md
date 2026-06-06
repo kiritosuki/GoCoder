@@ -335,7 +335,67 @@ GoCoder 多了几层：
 
 但当前版本已经覆盖 coding agent 的核心工程链路。
 
-## 25. 你在项目里遇到过什么问题？
+## 25. 和 Codex / Claude Code 这种生产级工具比，还差什么？
+
+我会先强调这个项目的定位：GoCoder 是轻量级教学和简历项目，目标是把 coding agent 的核心链路讲清楚，不是要在几千行代码里复刻完整商用产品。
+
+如果对齐生产级工具，主要差在这些方面：
+
+1. **编辑能力更强**
+   现在主要是 `old_string -> new_string` 的精确替换。生产级工具通常有更完整的 patch 引擎，能处理多文件 patch、上下文偏移、冲突恢复、dry-run 和更标准的 unified diff。
+
+2. **自动验证闭环更完整**
+   现在能执行 shell 和测试，但还没有专门的“修改后自动选择测试、解析失败、继续修复”的 workflow。生产级 coding agent 会把 test failure parsing 和下一轮修复做得更系统。
+
+3. **上下文管理更精细**
+   GoCoder 有 token 估算、snip 和 model compact，但生产级工具会有更强的代码索引、语义检索、文件相关性排序、长期项目记忆和更精确 tokenizer。
+
+4. **MCP 能力更完整**
+   目前 GoCoder 实现的是 MCP tools 子集：`initialize`、`tools/list`、`tools/call`。后续可以支持 resources、prompts、sampling、streamable HTTP/SSE 等更完整协议能力。
+
+5. **安全沙箱更严格**
+   现在有 workspace boundary、权限审批和 shell 风险识别。生产级工具还会有更强的命令解析、系统级 sandbox、网络访问策略、审计日志和可配置 policy。
+
+6. **评测体系更成熟**
+   GoCoder 有单元测试和 MCP 集成测试，但生产级工具需要 eval harness，比如跑一批真实 coding tasks，统计成功率、测试通过率、平均工具调用次数和失败原因。
+
+7. **用户体验和协作能力**
+   当前 TUI 是轻量可用。生产级工具会有更好的 diff 交互、任务计划展示、并发工具状态、撤销/回滚、checkpoint、分支管理和团队配置。
+
+面试时可以这样回答：
+
+> 当前版本我重点实现了 coding agent 的核心闭环：LLM tool calling、工具注册、权限审批、MCP tools、Skills、session trace 和 compact。和 Codex/Claude Code 这种生产级工具比，差距主要在 patch 引擎、自动测试修复闭环、代码索引/检索、更完整 MCP 协议、安全沙箱和 eval 体系。后续我会优先做 patch 引擎和测试修复循环，因为这两项最直接决定 coding agent 能不能稳定完成真实代码任务。
+
+## 26. 如果面试官追问“后续怎么改进”，怎么分阶段说？
+
+可以按三阶段回答：
+
+第一阶段，提升“改代码”的可靠性：
+
+- 标准 unified diff patch 引擎。
+- patch dry-run 和冲突检测。
+- 修改前后 diff preview。
+- 失败时让模型基于错误重新生成 patch。
+
+第二阶段，提升“完成任务”的可靠性：
+
+- 自动选择并运行相关测试。
+- 解析测试失败日志。
+- 限制 N 轮自动修复。
+- 最终回答里报告验证结果。
+
+第三阶段，提升“生产化”的可靠性：
+
+- 代码索引和语义检索。
+- 更完整 MCP resources/prompts。
+- 更严格 sandbox 和 policy。
+- eval harness 统计任务成功率。
+
+一句话总结：
+
+> 我不会一上来堆大功能，而是先补最影响真实 coding agent 成功率的两个核心：patch 可靠性和测试反馈闭环。然后再做检索、MCP 完整性、安全策略和 eval。
+
+## 27. 你在项目里遇到过什么问题？
 
 一个典型问题是 MCP 兼容性。
 
@@ -345,6 +405,6 @@ GoCoder 多了几层：
 
 这个问题说明 MCP 不是只写一个 mock server 就够，还要用公开 server 做兼容性验证。
 
-## 26. 面试时 1 分钟版本怎么讲？
+## 28. 面试时 1 分钟版本怎么讲？
 
 GoCoder 是我用 Go 写的轻量级终端 Coding Agent，兼容 OpenAI 标准接口，可以接 GPT 和 DeepSeek。它的核心是一个多轮 Agent Loop：模型返回 tool calls，程序做权限审批后执行工具，再把 tool result 喂回模型继续推理。工具系统包括文件读写、grep、shell，也支持 MCP 接入外部工具。为了安全，我做了 workspace 边界、diff 预览、shell 风险识别和审批模型。为了可恢复和可解释，我用 JSONL 记录 message、tool_call、tool_result、permission 等事件。Skills 则用于把代码审查、发布流程这类流程知识注入 system prompt。整体定位是轻量但完整的 coding agent，而不是简单聊天 wrapper。

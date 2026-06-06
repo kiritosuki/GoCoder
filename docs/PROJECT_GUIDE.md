@@ -297,7 +297,22 @@ GoCoder 主要靠四点降低幻觉：
 
 > Coding agent 不能完全消灭幻觉，但可以把关键事实来源从模型记忆转移到工具读取和测试反馈。
 
-## 12. 你应该重点掌握的代码
+## 12. 和生产级 Coding Agent 的差距
+
+GoCoder 当前覆盖的是轻量级 coding agent 的核心工程链路。它和 Codex / Claude Code 这类生产级工具相比，主要差在：
+
+- **Patch 引擎**：当前是精确字符串替换，后续可以做标准 unified diff patch、dry-run、冲突检测和回滚。
+- **自动验证闭环**：当前能运行命令，但没有专门的测试选择、失败日志解析、自动修复循环。
+- **上下文检索**：当前有 token 估算和 compact，但没有代码索引、语义检索、文件相关性排序。
+- **MCP 完整性**：当前实现 MCP tools 子集，后续可支持 resources、prompts、streamable HTTP/SSE。
+- **安全沙箱**：当前有 workspace boundary 和审批，后续可做更严格的命令解析、网络策略、审计日志。
+- **Eval 体系**：当前有单元测试和集成测试，后续可做 coding task benchmark，统计成功率和失败原因。
+
+面试时可以说：
+
+> 当前版本我重点做核心闭环，后续不会盲目堆功能，而是优先补 patch 可靠性和测试反馈闭环。这两项最直接决定 coding agent 能不能稳定完成真实代码任务。
+
+## 13. 你应该重点掌握的代码
 
 面试前重点读这些函数：
 

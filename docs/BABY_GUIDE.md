@@ -2147,7 +2147,51 @@ func (m *model) cleanup() {
 
 > MCP 协议兼容性。真实公开 server 对规范中 "params 可为 null" 不兼容，只接受 `{}`。反映了协议落地中的现实问题：协议是理想，实现是妥协。我通过 opt-in 的真实 server 测试来持续验证。
 
-### 15.4 代码重点回顾（面试前重读）
+**Q: 和 Codex / Claude Code 这种生产级工具比，还差什么？**
+
+> GoCoder 的定位是轻量级教学和简历项目，重点是把 coding agent 的核心闭环做清楚。和生产级工具比，差距主要在：更强的 patch 引擎、自动测试修复闭环、代码索引和语义检索、更完整的 MCP resources/prompts、更严格的 sandbox/policy、以及系统化 eval benchmark。
+
+**Q: 后续你会怎么改进？**
+
+> 我会分阶段做。第一阶段补 patch 可靠性：标准 unified diff、dry-run、冲突检测和回滚。第二阶段补测试反馈闭环：修改后自动选择测试、解析失败日志、限制 N 轮自动修复。第三阶段做生产化能力：代码索引、MCP resources/prompts、安全策略和 eval harness。优先级最高的是 patch 引擎和测试修复循环，因为它们最直接影响 coding agent 的真实任务成功率。
+
+### 15.4 生产级差距：你要怎么理解这个问题
+
+不要把“还差什么”说成项目失败。正确说法是：
+
+> 这个项目已经覆盖了 coding agent 的核心链路，但它是轻量级实现，不是商用级产品。生产级工具做得更深的是可靠性、规模化和用户体验。
+
+可以按六个方向回答：
+
+1. **编辑可靠性**
+   - 当前：`edit_file` 精确字符串替换。
+   - 生产级：标准 patch 引擎、多文件 patch、上下文偏移、冲突恢复、撤销回滚。
+
+2. **验证闭环**
+   - 当前：Agent 可以调用 `run_command` 运行测试。
+   - 生产级：自动判断该跑哪些测试，解析失败日志，继续修复，最后报告验证结果。
+
+3. **上下文和检索**
+   - 当前：热上下文 + token 估算 + snip/model compact。
+   - 生产级：代码索引、语义检索、文件相关性排序、长期项目记忆、更精确 tokenizer。
+
+4. **MCP 完整协议**
+   - 当前：实现 MCP tools 子集，支持 `tools/list` 和 `tools/call`。
+   - 生产级：还会支持 resources、prompts、sampling、streamable HTTP/SSE、server health 等。
+
+5. **安全和审计**
+   - 当前：workspace boundary、权限审批、shell 风险标签。
+   - 生产级：系统级 sandbox、网络访问策略、命令 AST 解析、企业 policy、审计日志。
+
+6. **评测体系**
+   - 当前：单元测试、mock MCP、公开 MCP opt-in 测试。
+   - 生产级：coding task benchmark，统计任务成功率、工具调用次数、耗时、失败类型。
+
+一句面试总结：
+
+> 我后续会优先做 patch 引擎和测试修复循环。因为对于 coding agent 来说，能不能稳定、可验证地改代码，比继续堆 UI 或接更多 provider 更重要。
+
+### 15.5 代码重点回顾（面试前重读）
 
 | 优先级 | 函数 | 在哪个文件 | 为什么重要 |
 |--------|------|-----------|----------|
