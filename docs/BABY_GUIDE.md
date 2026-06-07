@@ -1420,166 +1420,1064 @@ func (a *Agent) requestApproval(tc types.ToolCall) bool {
 
 ---
 
-## <a id="第9章"></a>第 9 章：MCP 协议——接入外部工具的标准
+## <a id="第9章"></a>第 9 章：MCP 协议——接入外部工具的标准（深度精讲）
 
-> **文件**：`internal/mcp/mcp.go`
+> **文件**：`internal/mcp/mcp.go`（656 行，项目中最复杂的单文件模块）
+>
+> **本章目标**：不只要让你知道 MCP"是什么"，更要让你完全理解 MCP 的每一行核心代码是如何工作的，以及 MCP 工具是如何跟本地工具统一在一个调用接口下的。
 
-### 9.1 什么是 MCP
+### 9.1 背景：为什么需要 MCP
 
-MCP（Model Context Protocol）是 Anthropic 推出的开放协议，定义了 AI 应用如何与外部工具和数据源通信。
+想象一下：你写了一个 Coding Agent，内置了 read_file、write_file、grep、shell 这 7 个工具。但用户想要的远不止这些——他们可能想让 Agent 操作数据库、发 GitHub PR、控制浏览器、搜索文档……
 
-**通俗理解**：MCP 就是工具的 USB 接口标准。GoCoder 实现了 MCP 的工具调用子集，所以可以接入很多提供 `tools/list` 和 `tools/call` 的 MCP 工具服务器，比如文件系统、memory、浏览器、GitHub API 等。当前没有实现 MCP resources/prompts 等更完整的能力。
+你不可能把所有工具都内置。你需要一个 **标准接口**，让第三方可以开发工具服务器，你的 Agent 通过这个接口来发现和调用它们。
 
-### 9.2 协议流程
+这就是 MCP（Model Context Protocol）要解决的问题。它定义了一套标准：
+- 如何**发现**远程有哪些工具（`tools/list`）
+- 如何**调用**这些工具（`tools/call`）
+- 通信格式是什么（JSON-RPC 2.0）
+- 传输方式有哪些（stdio / HTTP）
+
+### 9.2 GoCoder 实现了什么
+
+GoCoder 的 MCP 模块约 650 行代码，实现了 MCP 协议的工具调用子集：
 
 ```
-GoCoder (Client)                    MCP Server
-    │                                    │
-    │─── initialize ───────────────────→│  握手：协议版本 + 能力声明
-    │←── capabilities + serverInfo ─────│
-    │                                    │
-    │─── notifications/initialized ────→│  通知：初始化完成（不需要响应）
-    │                                    │
-    │─── tools/list ───────────────────→│  问：你有什么工具？
-    │←── [echo, get_time, ...] ────────│
-    │                                    │
-    │─── tools/call("echo", args) ─────→│  执行工具
-    │←── "ECHO: hello" ────────────────│
+完整 MCP 协议：
+├── 工具调用（tools/list + tools/call）    ← GoCoder 实现了
+├── Resources（资源读取）                   ← 未实现
+├── Prompts（提示模板）                     ← 未实现
+├── Sampling（LLM 采样）                    ← 未实现
+└── ...
 ```
 
-通信格式是 **JSON-RPC 2.0**：
+**但核心的"把外部工具接入 Agent"这件事，已经完整实现了。**
 
+### 9.3 整体架构：两层设计
+
+GoCoder 的 MCP 模块分两层：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Manager（管理层）                      │
+│  - 管理多个 MCP Server 连接                              │
+│  - 维护工具名 → 来源 Server 的映射（binding）             │
+│  - 处理工具名冲突（重命名策略）                           │
+│  - 提供统一调用接口：CallRegisteredTool(toolName, args)  │
+└────────────┬────────────┬────────────┬──────────────────┘
+             │            │            │
+    ┌────────▼───┐ ┌──────▼───┐ ┌─────▼────┐
+    │ Client A   │ │ Client B │ │ Client C │  每个 Client 管理一个 MCP Server
+    │ (stdio)    │ │ (http)   │ │ (stdio)  │
+    └────────────┘ └──────────┘ └──────────┘
+```
+
+- **Client**：管理**一个** MCP Server 的连接，负责 JSON-RPC 通信
+- **Manager**：管理**多个** Client，负责工具名路由和冲突处理
+
+### 9.4 Client 结构体——逐字段讲解
+
+```go
+type Client struct {
+    config types.MCPConfig   // 用户配置：command、args、url、env
+    name   string            // server 别名（如 "memory"、"filesystem"）
+    mode   string            // "stdio" 或 "http"
+
+    // ──── Stdio 专用字段 ────
+    cmd    *exec.Cmd         // 启动的 MCP Server 子进程
+    stdin  io.WriteCloser    // 管道：GoCoder → MCP Server（写请求）
+    stdout io.ReadCloser     // 管道：MCP Server → GoCoder（读响应）
+    stderr io.ReadCloser     // 管道：MCP Server 的日志输出（需要消费掉）
+
+    // ──── HTTP 专用字段 ────
+    httpClient *http.Client  // HTTP 客户端，超时 30s
+    httpURLs   []string      // 候选 URL 列表（兼容不同路径约定）
+
+    // ──── 请求/响应匹配（stdio 模式核心）──
+    requestID atomic.Int64                     // 原子递增的请求 ID
+    writeMu   sync.Mutex                       // stdin 写锁（防止并发写交错）
+    pendingMu sync.Mutex                       // pending map 的锁
+    pending   map[int]chan *types.JSONRPCResponse  // ID → 等待通道
+    readErr   chan error                       // readLoop 发现错误时通知
+    done      chan struct{}                    // 关闭信号
+
+    // ──── 缓存 ────
+    tools      []types.MCPToolDefinition   // 从 MCP Server 获取的工具列表
+    serverInfo map[string]any              // initialize 时返回的 server 信息
+}
+```
+
+**每个字段为什么存在**：
+
+| 字段 | 为什么需要 |
+|------|-----------|
+| `requestID atomic.Int64` | 每个 JSON-RPC 请求需要唯一 ID 来做响应匹配；`atomic` 保证多 goroutine 安全 |
+| `writeMu sync.Mutex` | stdio 模式下 stdin 是共享的，虽然 GoCoder 目前串行调用，但这是防御性设计 |
+| `pending map[int]chan` | **核心匹配机制**：发请求时注册一个 channel，readLoop 收到响应后按 ID 投递 |
+| `readErr chan error` | readLoop 运行在另一个 goroutine，它出错时需要通知等待中的 stdioCall |
+| `done chan struct{}` | 优雅关闭信号，通知 readLoop 停止 |
+| `stderr io.ReadCloser` | MCP Server 的日志输出到 stderr，如果不消费会导致 pipe 缓冲区满、server 阻塞 |
+
+### 9.5 协议全流程（用真实 JSON 展示）
+
+以下面这个场景为例——GoCoder 连接一个名为 "test" 的 MCP Server：
+
+#### 第一步：initialize（握手）
+
+GoCoder 发送：
 ```json
-// 请求（有 id，期待响应）
-{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-
-// 响应
-{"jsonrpc": "2.0", "id": 1, "result": {"tools": [...]}}
-
-// 通知（无 id，不需要响应）
-{"jsonrpc": "2.0", "method": "notifications/initialized"}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+    "protocolVersion":"2024-11-05",
+    "capabilities":{},
+    "clientInfo":{"name":"GoCoder","version":"1.0.0"}
+}}
 ```
 
-**关键区别**：请求有 `id`（需要匹配响应），通知没有 `id`。GoCoder 的 `readLoop` 只处理有 id 的响应，通知会被忽略。
+MCP Server 响应：
+```json
+{"jsonrpc":"2.0","id":1,"result":{
+    "protocolVersion":"2024-11-05",
+    "capabilities":{"tools":{}},
+    "serverInfo":{"name":"test-mcp","version":"1.0.0"}
+}}
+```
 
-### 9.3 Stdio 模式——进程管道通信
+**协议版本 `2024-11-05`** 是 MCP 规范定义的最新版本号。`capabilities` 告诉对方自己支持什么能力。GoCoder 传空对象表示"我没有特殊能力声明"（这是合法的）。
+
+#### 第二步：notifications/initialized（通知）
+
+GoCoder 发送：
+```json
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+```
+
+**注意**：这是一条**通知**，没有 `id` 字段。MCP Server 不需要回复。
+
+#### 第三步：tools/list（发现工具）
+
+GoCoder 发送：
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+```
+
+MCP Server 响应：
+```json
+{"jsonrpc":"2.0","id":2,"result":{"tools":[
+    {
+        "name":"echo",
+        "description":"回显输入参数",
+        "inputSchema":{
+            "type":"object",
+            "properties":{"message":{"type":"string","description":"要回显的消息"}},
+            "required":["message"]
+        }
+    },
+    {
+        "name":"get_time",
+        "description":"返回当前时间",
+        "inputSchema":{"type":"object","properties":{"timezone":{"type":"string"}}}
+    }
+]}}
+```
+
+#### 第四步：tools/call（调用工具）
+
+GoCoder 发送：
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+    "name":"echo",
+    "arguments":{"message":"hello world"}
+}}
+```
+
+MCP Server 响应：
+```json
+{"jsonrpc":"2.0","id":3,"result":{
+    "content":[{"type":"text","text":"ECHO: hello world"}]
+}}
+```
+
+**关键点**：`content` 是一个数组，每个元素有 `type` 字段。这是 MCP 规范定义的富内容模型——可以是 `text`、`image`、`resource` 等。GoCoder 目前只处理 `text` 类型（因为要给 LLM 看），image 和 resource 会给一个占位说明。
+
+### 9.6 Stdio 模式——进程管道深度讲解
+
+Stdio 是 MCP 最基础的传输方式：启动一个子进程，通过 stdin/stdout 用换行分隔的 JSON 通信。
+
+#### 9.6.1 创建连接：NewStdioClient
 
 ```go
 func NewStdioClient(name string, cfg types.MCPConfig) (*Client, error) {
-    // 启动 MCP Server 进程
+    // 第一步：准备命令
     cmd := exec.Command(cfg.Command, cfg.Args...)
-    stdin,  _ := cmd.StdinPipe()   // GoCoder → MCP Server（发送请求）
-    stdout, _ := cmd.StdoutPipe()  // MCP Server → GoCoder（接收响应）
-    stderr, _ := cmd.StderrPipe()  // MCP Server 日志（丢弃）
-    cmd.Start()
+    // 如果配置了自定义环境变量，追加到进程环境
+    if len(cfg.Env) > 0 {
+        cmd.Env = cmd.Environ()           // 继承当前进程环境
+        for k, v := range cfg.Env {
+            cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+        }
+    }
 
-    c := &Client{...}
-    go c.readLoop()   // 后台 goroutine 持续读 stdout
-    go drain(stderr)  // 后台 goroutine 消费 stderr（防止缓冲区满导致 server 阻塞）
+    // 第二步：创建管道（在 Start 之前！）
+    stdin,  _ := cmd.StdinPipe()    // 写端：Go 往这里写 → MCP Server 的 stdin
+    stdout, _ := cmd.StdoutPipe()   // 读端：MCP Server 的 stdout → Go 从这里读
+    stderr, _ := cmd.StderrPipe()   // 读端：MCP Server 的 stderr → Go 从这里读（然后丢弃）
+
+    // 第三步：启动进程
+    cmd.Start()
+    // 注意：这里用的是 Start() 而非 Run()。Run() 会阻塞等进程退出，
+    // Start() 不等待，让 MCP Server 在后台运行。
+
+    // 第四步：构建 Client 并启动后台 goroutine
+    c := &Client{
+        config:  cfg,
+        name:    name,
+        mode:    "stdio",
+        cmd:     cmd,
+        stdin:   stdin,
+        stdout:  stdout,
+        stderr:  stderr,
+        pending: make(map[int]chan *types.JSONRPCResponse),
+        readErr: make(chan error, 1),     // 缓冲 1，防止发送阻塞
+        done:    make(chan struct{}),
+    }
+    go c.readLoop()   // 后台协程1：持续从 stdout 读取 MCP Server 的响应
+    go drain(stderr)  // 后台协程2：持续消费 stderr（读到就丢弃）
+
     return c, nil
 }
 ```
 
-**核心并发模型**：
+**时序关系**：
+
+```
+时间线 →
+
+主 goroutine:     NewStdioClient → 返回 Client → 后续调用 Initialize()
+                       │
+                       ├── cmd.Start() 启动子进程
+                       ├── go readLoop() 启动后台读协程
+                       └── go drain(stderr) 启动 stderr 消费协程
+
+readLoop goroutine:    ═══════════════════════════════════════════
+                       阻塞在 reader.ReadString('\n')，等待 MCP Server 输出
+
+drain goroutine:       ═══════════════════════════════════════════
+                       阻塞在 io.Copy，消费 stderr
+
+MCP Server 进程:                   运行中，阻塞在 stdin 读取，等待 GoCoder 发请求
+```
+
+**为什么管道要在 Start() 之前创建？** `StdinPipe()` / `StdoutPipe()` 必须在 `cmd.Start()` 之前调用——Go 需要在启动进程前建立管道连接。如果在之后调用会 panic。
+
+**为什么用 Start() 而不是 Run()？** `Run()` = `Start()` + `Wait()`。`Wait()` 会阻塞直到进程退出，而我们希望 MCP Server 持续运行、随时接收请求。
+
+#### 9.6.2 stderr 的处理：drain
 
 ```go
-// readLoop：后台 goroutine，持续从 stdout 读取
-func (c *Client) readLoop() {
-    reader := bufio.NewReader(c.stdout)
-    for {
-        line, err := reader.ReadString('\n')
-        var resp types.JSONRPCResponse
-        json.Unmarshal([]byte(line), &resp)
+func drain(r io.Reader) {
+    _, _ = io.Copy(io.Discard, r)  // 读多少丢多少
+}
+```
 
-        // 按 id 找到对应的等待通道
+**为什么需要 drain stderr？** 如果 MCP Server 往 stderr 写了很多日志但没人读，pipe 的缓冲区（通常 64KB）会满，然后 MCP Server 的 `write(stderr, ...)` 会阻塞。Server 一阻塞，就不再处理 stdin 的请求，整个链路就卡死了。
+
+`drain` 持续消费 stderr，保证缓冲区永远不会满。因为 stderr 对 GoCoder 没用，读到就直接丢给 `io.Discard`。
+
+### 9.7 HTTP 模式——双路径尝试
+
+```go
+func NewHTTPClient(name string, cfg types.MCPConfig) (*Client, error) {
+    base := strings.TrimRight(cfg.URL, "/")
+    urls := []string{base}
+    // 如果 URL 不以 /mcp 结尾，同时尝试 /mcp 路径和根路径
+    if !strings.HasSuffix(base, "/mcp") {
+        urls = []string{base + "/mcp", base}
+    }
+    return &Client{
+        config:     cfg,
+        name:       name,
+        mode:       "http",
+        httpClient: &http.Client{Timeout: defaultTimeout},  // 30s 超时
+        httpURLs:   urls,
+    }, nil
+}
+```
+
+**为什么需要双路径？** 不同 MCP Server 的 HTTP 路由约定不同：
+- 有些在根路径 `/` 接受 JSON-RPC 请求
+- 有些在 `/mcp` 路径
+- 有些两个都支持
+
+GoCoder 的策略是：先试 `/mcp`，失败再试根路径。这样兼容性最好。
+
+**HTTP 模式没有 `pending` map 和 `readLoop`**。因为 HTTP 是同步的请求-响应模型——发 POST 请求，等 HTTP 响应回来就完了。不需要像 stdio 那样做 ID 匹配。
+
+### 9.8 Initialize——握手过程精讲
+
+```go
+func (c *Client) Initialize() error {
+    // 第一步：发送 initialize 请求
+    params := map[string]any{
+        "protocolVersion": "2024-11-05",       // 协议版本
+        "capabilities":    map[string]any{},    // 客户端能力声明（空=没有特殊能力）
+        "clientInfo": map[string]string{        // 客户端身份
+            "name":    "GoCoder",
+            "version": "1.0.0",
+        },
+    }
+
+    resp, err := c.sendRequest("initialize", params)
+    if err != nil {
+        return fmt.Errorf("MCP initialize 失败: %w", err)
+    }
+
+    // 第二步：解析响应，提取 serverInfo
+    var result struct {
+        ProtocolVersion string         `json:"protocolVersion"`
+        Capabilities    map[string]any `json:"capabilities"`
+        ServerInfo      map[string]any `json:"serverInfo"`
+    }
+    json.Unmarshal(resp.Result, &result)
+    c.serverInfo = result.ServerInfo  // 存起来（比如可能是 {"name":"playwright","version":"1.0"}）
+
+    // 第三步：发送 initialized 通知（notification，无 id，不需要响应）
+    if err := c.sendNotification("notifications/initialized", nil); err != nil {
+        return fmt.Errorf("发送 initialized 通知失败: %w", err)
+    }
+    return nil
+}
+```
+
+**三步握手**：
+1. 客户端发 `initialize`（告知协议版本和客户端身份）
+2. 服务端回复（告知协议版本、能力、服务端身份）
+3. 客户端发 `notifications/initialized`（确认握手完成）
+
+**为什么 initialized 是通知而非请求？** 因为它不需要服务器回复。JSON-RPC 中，通知 = 没有 `id` 字段的消息。服务器不应该回复通知，否则会有无 ID 的响应。
+
+**面试考点**：MCP 的 initialize 是双向声明的——客户端告诉服务端"我要用这个协议版本"，服务端告诉客户端"我支持这些能力"。握手完成后，双方再按能力声明来决定后续交互。
+
+### 9.9 DiscoverTools——获取并规范化工具列表
+
+```go
+func (c *Client) DiscoverTools() ([]types.MCPToolDefinition, error) {
+    // 发送 tools/list 请求
+    resp, err := c.sendRequest("tools/list", nil)
+    // ...
+
+    // 解析 tools 数组
+    var result struct {
+        Tools []types.MCPToolDefinition `json:"tools"`
+    }
+    json.Unmarshal(resp.Result, &result)
+
+    // 关键：规范化工具（清洗名称、补齐缺失字段）
+    c.tools = normalizeTools(result.Tools)
+    return c.tools, nil
+}
+```
+
+**normalizeTools 做三件事**：
+
+```go
+func normalizeTools(tools []types.MCPToolDefinition) []types.MCPToolDefinition {
+    for _, t := range tools {
+        // 1. 清洗名称：只保留 [a-zA-Z0-9_-]，替换其他字符为 _
+        t.Name = sanitizeToolName(t.Name)
+        if t.Name == "" { continue }  // 名称非法就跳过
+
+        // 2. 补充描述：没描述的给个默认值
+        if t.Description == "" {
+            t.Description = "MCP tool " + t.Name
+        }
+
+        // 3. 补充 schema：没 inputSchema 的给个空对象（兼容不规范 server）
+        if t.InputSchema == nil {
+            t.InputSchema = map[string]any{"type": "object", "properties": map[string]any{}}
+        }
+    }
+}
+```
+
+**`sanitizeToolName`**：
+```go
+var invalidToolNameChars = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+
+func sanitizeToolName(name string) string {
+    name = strings.TrimSpace(name)
+    name = invalidToolNameChars.ReplaceAllString(name, "_")  // 非法字符 → _
+    name = strings.Trim(name, "_")                            // 去首尾下划线
+    if len(name) > 64 { name = name[:64] }                    // 截断到 64 字符
+    return name
+}
+```
+
+**为什么需要 normalize？** 外部 MCP Server 来自不同开发者，工具名可能含空格、特殊字符等。GoCoder 需要保证工具名在 Tool Registry 中合法——因为 Registry 用名字做 key，名字里有空格或非法字符会导致各种问题。
+
+### 9.10 sendRequest——请求分发的枢纽
+
+```go
+func (c *Client) sendRequest(method string, params any) (*types.JSONRPCResponse, error) {
+    // 第一步：原子递增请求 ID（线程安全）
+    id := int(c.requestID.Add(1))
+
+    // 第二步：参数编码（nil → {}）
+    paramsJSON, _ := encodeParams(params)
+
+    // 第三步：构建 JSON-RPC 请求
+    req := types.JSONRPCRequest{
+        JSONRPC: "2.0",
+        ID:      id,
+        Method:  method,
+        Params:  paramsJSON,
+    }
+
+    // 第四步：按模式分发
+    if c.mode == "http" {
+        return c.httpCall(req)
+    }
+    return c.stdioCall(req)
+}
+```
+
+这是所有 MCP 操作的统一入口——initialize、tools/list、tools/call 都通过这个方法发送请求。它根据 `mode` 字段决定走 stdio 还是 HTTP 路径。
+
+### 9.11 stdioCall + readLoop——请求/响应匹配机制（核心！）
+
+这是整个 MCP 模块最精妙的设计。
+
+#### 9.11.1 stdioCall：发送并等待
+
+```go
+func (c *Client) stdioCall(req types.JSONRPCRequest) (*types.JSONRPCResponse, error) {
+    // 第一步：创建一个专属通道
+    ch := make(chan *types.JSONRPCResponse, 1)
+
+    // 第二步：将通道注册到 pending map（key = 请求 ID）
+    c.pendingMu.Lock()
+    c.pending[req.ID] = ch
+    c.pendingMu.Unlock()
+    defer c.removePending(req.ID)  // 函数结束时清理
+
+    // 第三步：序列化请求 + 追加换行符
+    data, _ := json.Marshal(req)
+    data = append(data, '\n')   // 每个 JSON-RPC 消息以换行符分隔！
+
+    // 第四步：写入 stdin（用写锁保护，防止并发写入交错的 JSON）
+    c.writeMu.Lock()
+    _, err := c.stdin.Write(data)
+    c.writeMu.Unlock()
+    if err != nil {
+        return nil, fmt.Errorf("写入请求失败: %w", err)
+    }
+
+    // 第五步：等待响应（四选一）
+    timer := time.NewTimer(defaultTimeout)  // 30s 超时
+    defer timer.Stop()
+
+    select {
+    case resp := <-ch:          // 情况A：readLoop 收到了匹配的响应
+        if resp.Error != nil {
+            return nil, fmt.Errorf("MCP 错误 [%d]: %s", resp.Error.Code, resp.Error.Message)
+        }
+        return resp, nil
+
+    case err := <-c.readErr:    // 情况B：readLoop 报错了（pipe 断开等）
+        return nil, err
+
+    case <-timer.C:             // 情况C：30 秒超时，MCP Server 可能卡住了
+        return nil, fmt.Errorf("请求 %s 超时", req.Method)
+
+    case <-c.done:              // 情况D：Client 被关闭了
+        return nil, errors.New("MCP 连接已关闭")
+    }
+}
+```
+
+#### 9.11.2 readLoop：后台匹配响应
+
+```go
+func (c *Client) readLoop() {
+    reader := bufio.NewReader(c.stdout)  // 从 MCP Server 的 stdout 读取
+
+    for {
+        // 检查是否被关闭
+        select {
+        case <-c.done:
+            return
+        default:
+        }
+
+        // 读一行（阻塞直到有数据或管道关闭）
+        line, err := reader.ReadString('\n')
+        if err != nil {
+            // 通知所有等待中的 stdioCall：出错了
+            select {
+            case c.readErr <- fmt.Errorf("读取响应失败: %w", err):
+            default:  // 如果没人等待（缓冲区满），丢弃
+            }
+            return
+        }
+
+        line = strings.TrimSpace(line)
+        if line == "" { continue }
+
+        // 解析 JSON 响应
+        var resp types.JSONRPCResponse
+        if err := json.Unmarshal([]byte(line), &resp); err != nil {
+            continue  // 解析失败跳过（可能是 MCP Server 的启动日志行）
+        }
+
+        // ── 关键过滤：忽略无 ID 的响应（通知/日志不会被错配）──
+        if resp.ID == 0 {
+            continue
+        }
+
+        // 按 ID 找到等待通道，投递响应
         c.pendingMu.Lock()
         ch := c.pending[resp.ID]
         c.pendingMu.Unlock()
         if ch != nil {
-            ch <- &resp  // 通知等待者
+            ch <- &resp
+        }
+        // 如果 ch == nil，可能是请求已超时被 remove 了，响应被丢弃（没有问题）
+    }
+}
+```
+
+**关键设计点解析**：
+
+**1. 为什么 `resp.ID == 0` 的响应要被忽略？**
+
+因为 MCP Server 可能在真正的响应之前发一些通知（notification），比如：
+```json
+{"jsonrpc":"2.0","method":"notifications/progress","params":{"message":"loading..."}}
+```
+通知没有 `id`，JSON 反序列化后 `ID` 就是零值 0。如果不过滤，`pending[0]` 可能匹配到错误的通道。测试文件 `TestStdioSkipsNotificationBeforeResponse` 就验证了这一点——故意让 MCP Server 在 `tools/list` 响应前发一条通知，确保 GoCoder 不会被通知干扰。
+
+**2. `readErr` 是缓冲大小为 1 的 channel**
+
+`make(chan error, 1)`。因为 readLoop 只需要报一次错误就行——一旦 stdout pipe 断了，所有等待中的请求都应该失败。缓冲 1 防止没人等待时发送阻塞。
+
+**3. 为什么用 `bufio.NewReader` 而不是 `bufio.NewScanner`？**
+
+`bufio.Scanner` 默认 buffer 只有 64KB，超过会报 `bufio.Scanner: token too long`。`bufio.Reader.ReadString('\n')` 没有这个限制——MCP 响应（特别是 tools/list 返回很多工具时）可能很大。
+
+#### 9.11.3 完整匹配流程图
+
+```
+          stdioCall goroutine          │         readLoop goroutine
+                                       │
+    ① ch := make(chan)                 │
+    ② pending[id] = ch                 │
+    ③ stdin.Write(jsonReq+'\n') ──────┼──→ MCP Server stdin
+                                       │         │ 处理...
+                                       │         │
+    ④ select {                         │    MCP Server stdout ──→  reader.ReadString('\n')
+         case ch <- resp: ...          │         │
+         case <-timeout: ...           │    ⑤ resp = json.Unmarshal(line)
+         case <-readErr: ...           │    ⑥ if resp.ID == 0 → skip（通知）
+         case <-done: ...              │    ⑦ ch = pending[resp.ID]
+       }                               │    ⑧ ch <- &resp
+                                       │
+    ⑨ 收到响应，返回                    │    ⑩ 继续读下一行
+```
+
+这个模式叫做 **"Pending Map + Channel 匹配"**，是 Go 并发编程的经典模式。
+
+**面试话术**：
+> MCP 的 stdio 通信我用了 Pending Map + Channel 匹配的模式。发请求时生成唯一 ID，注册一个 channel 到 pending map，然后写 stdin。另一个后台 goroutine（readLoop）持续读 stdout，解析 JSON-RPC 响应后按 ID 找到对应 channel 投递。这样即使多个请求的响应乱序到达，也能正确匹配。同时有超时兜底（30s）、readLoop 报错通知、优雅关闭等多层保护。
+
+### 9.12 httpCall——URL 回退逻辑
+
+```go
+func (c *Client) httpCall(req types.JSONRPCRequest) (*types.JSONRPCResponse, error) {
+    data, _ := json.Marshal(req)
+
+    var lastErr error
+    for _, url := range c.httpURLs {  // 先试 /mcp，再试根路径
+        ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+        httpReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+        httpReq.Header.Set("Content-Type", "application/json")
+        httpReq.Header.Set("Accept", "application/json")
+
+        resp, err := c.httpClient.Do(httpReq)
+        cancel()
+        if err != nil {
+            lastErr = err
+            continue  // 网络错误，试下一个 URL
+        }
+
+        body, _ := io.ReadAll(resp.Body)
+        resp.Body.Close()
+
+        // 404 或 405 → 可能路径不对，试下一个 URL
+        if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+            lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+            continue
+        }
+        // 其他 HTTP 错误 → 直接报错
+        if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+            return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+        }
+
+        // 成功 → 解析 JSON-RPC 响应
+        var jsonResp types.JSONRPCResponse
+        json.Unmarshal(body, &jsonResp)
+        if jsonResp.Error != nil {
+            return nil, fmt.Errorf("MCP 错误 [%d]: %s", jsonResp.Error.Code, jsonResp.Error.Message)
+        }
+        return &jsonResp, nil
+    }
+    return nil, lastErr  // 所有 URL 都试过了，返回最后一个错误
+}
+```
+
+**URL 回退策略**：`httpURLs` 通常有两个值 `["http://host:port/mcp", "http://host:port"]`。先试 `/mcp`（标准路径），如果返回 404 或 405 说明路径不对，再试根路径。两个都失败才报错。
+
+### 9.13 sendNotification——通知发送
+
+```go
+func (c *Client) sendNotification(method string, params any) error {
+    if c.mode == "http" {
+        return nil  // HTTP 模式不需要发通知（MCP 规范中 HTTP 模式不支持 notification）
+    }
+
+    // 构建无 ID 的 JSON-RPC 消息
+    data, _ := json.Marshal(types.JSONRPCRequest{
+        JSONRPC: "2.0",
+        Method:  method,       // 没有 ID 字段！
+        Params:  paramsJSON,
+    })
+    data = append(data, '\n')
+
+    c.writeMu.Lock()
+    _, err = c.stdin.Write(data)
+    c.writeMu.Unlock()
+    return err
+}
+```
+
+**注意**：构建的 JSON-RPC 请求没有 `ID` 字段。MCP Server 通过缺少 `id` 来识别这是一条通知，不会回复。
+
+### 9.14 CallTool——工具调用和内容提取
+
+```go
+func (c *Client) CallTool(name string, arguments map[string]any) (string, error) {
+    // 发送 tools/call 请求
+    resp, _ := c.sendRequest("tools/call", map[string]any{
+        "name":      name,
+        "arguments": arguments,
+    })
+
+    // 优先按 MCP 标准格式解析：{"content": [{"type": "text", "text": "..."}, ...]}
+    var result struct {
+        Content []map[string]any `json:"content"`
+        IsError bool             `json:"isError"`
+    }
+    if err := json.Unmarshal(resp.Result, &result); err != nil {
+        // 兼容非标准格式：{"content": "plain string"} 或 {"content": {...}}
+        var simple struct {
+            Content any `json:"content"`
+        }
+        json.Unmarshal(resp.Result, &simple)
+        return stringify(simple.Content), nil
+    }
+
+    // 遍历 content 数组，按类型处理
+    parts := make([]string, 0, len(result.Content))
+    for _, item := range result.Content {
+        switch item["type"] {
+        case "text":
+            // 文本内容：提取出来给 LLM 看
+            if text, ok := item["text"].(string); ok && text != "" {
+                parts = append(parts, text)
+            }
+        case "image":
+            // 图片：LLM 看不到，给个占位说明
+            parts = append(parts, "[MCP image content omitted]")
+        case "resource":
+            // 资源：序列化后展示
+            parts = append(parts, stringify(item))
+        default:
+            // 未知类型：序列化整个 item
+            if len(item) > 0 {
+                parts = append(parts, stringify(item))
+            }
         }
     }
-}
+    out := strings.Join(parts, "\n")
 
-// stdioCall：发送请求并等待匹配的响应
-func (c *Client) stdioCall(req types.JSONRPCRequest) (*types.JSONRPCResponse, error) {
-    ch := make(chan *types.JSONRPCResponse, 1)
-
-    // 注册等待通道
-    c.pending[req.ID] = ch
-
-    // 写入 stdin（发送请求），注意用写锁保护
-    c.writeMu.Lock()
-    c.stdin.Write(data)
-    c.writeMu.Unlock()
-
-    // 等待响应（或超时 30s）
-    select {
-    case resp := <-ch: return resp, nil
-    case <-timer.C:    return nil, fmt.Errorf("请求超时")
-    case <-c.done:     return nil, errors.New("连接已关闭")
+    if result.IsError {
+        return out, fmt.Errorf("MCP 工具 %s 返回错误: %s", name, out)
     }
+    return out, nil
 }
 ```
 
-**用图表示**：
+**为什么有两次 Unmarshal？** 这是兼容性设计：
+- 标准 MCP Server 返回 `{"content": [{"type": "text", "text": "..."}]}`（GoCoder 优先解析这个格式）
+- 非标准 Server 可能返回 `{"content": "plain text"}` 或 `{"content": {...}}`（回退解析）
 
-```
-stdioCall goroutine           readLoop goroutine
-     │                              │
-     ├─ 注册 ch = pending[id] ──┐   │
-     ├─ 写 stdin ──────────────→│   │
-     │                           ├─ 读 stdout ← MCP Server
-     │                           ├─ 解析 JSON
-     │                           ├─ 找到 pending[id]
-     │   pending[id] ← ch ←─────┤
-     ├─ 收到响应                  │
-     └─ 返回                     └─ 继续读下一行
+两次解析保证无论哪种格式都能拿到内容。
+
+### 9.15 Close——优雅关闭
+
+```go
+func (c *Client) Close() error {
+    if c.mode != "stdio" {
+        return nil  // HTTP 模式不需要关闭
+    }
+
+    // 第一步：关闭 done channel（通知 readLoop 退出）
+    select {
+    case <-c.done:
+        // 已经关闭过了
+    default:
+        close(c.done)
+    }
+
+    // 第二步：关闭 stdin（告诉 MCP Server "不再发送请求了"）
+    if c.stdin != nil {
+        c.stdin.Close()
+    }
+
+    // 第三步：杀掉进程并等待退出
+    if c.cmd != nil && c.cmd.Process != nil {
+        c.cmd.Process.Kill()
+        c.cmd.Wait()
+    }
+    return nil
+}
 ```
 
-### 9.4 Manager——管理多个 MCP Server + 工具名去重
+**优雅关闭的顺序很重要**：
+1. `close(done)` → readLoop 检测到退出
+2. `stdin.Close()` → MCP Server 的 stdin 收到 EOF，可以自行退出
+3. `Process.Kill()` → 兜底，确保进程一定死掉
+4. `Wait()` → 回收进程资源，防止僵尸进程
+
+### 9.16 Manager——多 Server 管理和统一调用接口
+
+这是把 MCP 工具接入 Agent 的关键层。
+
+#### 9.16.1 数据结构
 
 ```go
 type Manager struct {
-    clients  map[string]*Client      // server 名 → 客户端
-    bindings map[string]ToolBinding  // GoCoder 中的工具名 → 来源
-}
-
-type ToolBinding struct {
-    ServerName     string  // 来自哪个 server
-    OriginalName   string  // server 端的原始名
-    RegisteredName string  // GoCoder 中的注册名（可能改名）
+    clients  map[string]*Client       // "memory" → Client, "filesystem" → Client
+    bindings map[string]ToolBinding   // "echo" → {ServerName:"test-srv", OriginalName:"echo"}
+    mu       sync.RWMutex             // 读写锁（多读少写场景最优）
 }
 ```
 
-**工具名冲突处理**：
+**两个 map 的关系**：
 
 ```
-第一个 server 注册 "echo"  → 直接叫 "echo"
-第二个 server 注册 "echo"  → 改名为 "server2__echo"
-第三个不同 server 注册 "echo" → 改名为 "server3__echo"
-如果同一个前缀也冲突，才会追加数字后缀，例如 "server3__echo_2"
+clients:  server 名 → 连接
+bindings: 工具注册名 → 来源信息
+
+示例状态：
+clients = {
+    "test-srv":  Client{tools: [echo, get_time]},
+    "memory":    Client{tools: [create_entities, read_graph]},
+}
+bindings = {
+    "echo":              {ServerName: "test-srv", OriginalName: "echo"},
+    "get_time":          {ServerName: "test-srv", OriginalName: "get_time"},
+    "create_entities":   {ServerName: "memory",  OriginalName: "create_entities"},
+    "read_graph":        {ServerName: "memory",  OriginalName: "read_graph"},
+}
 ```
 
-### 9.5 兼容性问题：nil params → {}
+#### 9.16.2 Connect——连接并注册工具的完整流程
 
 ```go
-func encodeParams(params any) (json.RawMessage, error) {
-    if params == nil {
-        return json.RawMessage(`{}`), nil  // nil → 空 JSON 对象
+func (m *Manager) Connect(name string, cfg types.MCPConfig) error {
+    // ── 第一步：创建 Client ──
+    var client *Client
+    var err error
+    if cfg.URL != "" {
+        client, err = NewHTTPClient(name, cfg)      // HTTP 模式
+    } else {
+        client, err = NewStdioClient(name, cfg)     // Stdio 模式
     }
-    data, err := json.Marshal(params)
-    return data, err
+    if err != nil {
+        return fmt.Errorf("连接 MCP server %s 失败: %w", name, err)
+    }
+
+    // ── 第二步：握手 ──
+    if err := client.Initialize(); err != nil {
+        client.Close()
+        return fmt.Errorf("初始化 MCP server %s 失败: %w", name, err)
+    }
+
+    // ── 第三步：发现工具 ──
+    if _, err := client.DiscoverTools(); err != nil {
+        client.Close()
+        return fmt.Errorf("发现 MCP 工具失败 %s: %w", name, err)
+    }
+
+    // ── 第四步：注册到 Manager（加写锁）──
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    // 如果同名 server 已存在，先关闭旧的
+    if old := m.clients[name]; old != nil {
+        old.Close()
+    }
+    // 清除该 server 之前所有的工具绑定（可能工具列表变了）
+    for registered, binding := range m.bindings {
+        if binding.ServerName == name {
+            delete(m.bindings, registered)
+        }
+    }
+
+    // 添加新 client
+    m.clients[name] = client
+
+    // 为每个工具建立绑定（处理命名冲突）
+    for _, t := range client.Tools() {
+        registered := m.uniqueToolNameLocked(name, t.Name)
+        m.bindings[registered] = ToolBinding{
+            ServerName:     name,
+            OriginalName:   t.Name,
+            RegisteredName: registered,
+        }
+    }
+    return nil
 }
 ```
 
-这是实际踩过的坑。规范允许 `params` 为 null，但真实公开 MCP server `@modelcontextprotocol/server-memory` 只接受 `params: {}`。兼容性比完美遵循规范更重要。
+**第四步为什么要先清除旧绑定？** 因为 MCP Server 可能升级了、工具列表变了（新增了工具或删除了旧工具）。清除后重新注册保证绑定表始终准确。
 
-**面试话术**（如果有面试官问遇到的困难）：
+#### 9.16.3 统一调用接口：CallRegisteredTool
 
-> MCP 兼容性是个实际问题。公开的 memory MCP server 对 `params: null` 没响应，但对 `params: {}` 正常。所以我加了 nil→{} 的编码处理，并写了 opt-in 的公开 server 测试来验证兼容性。协议实现不能只看规范，还要用真实服务验证。
+这是 MCP 工具"伪造成本地工具"的关键函数：
+
+```go
+// CallRegisteredTool 通过注册名调用工具（不需要知道 server 名）
+func (m *Manager) CallRegisteredTool(toolName string, args map[string]any) (string, error) {
+    return m.CallTool("", toolName, args)  // serverName 为空，让 CallTool 通过 binding 查找
+}
+
+// CallTool 的两用模式
+func (m *Manager) CallTool(serverName, toolName string, args map[string]any) (string, error) {
+    m.mu.RLock()
+    // 如果在 bindings 中找到了，用 binding 信息覆盖
+    if binding, ok := m.bindings[toolName]; ok {
+        serverName = binding.ServerName   // 自动找到正确的 server
+        toolName = binding.OriginalName   // 自动还原原始工具名
+    }
+    client := m.clients[serverName]
+    m.mu.RUnlock()
+
+    if client == nil {
+        return "", fmt.Errorf("MCP server %s 未连接", serverName)
+    }
+    return client.CallTool(toolName, args)
+}
+```
+
+**`CallRegisteredTool` 的设计意图**：外部调用者（Tool Registry 的 Executor）只知道工具在 GoCoder 中的注册名（比如 `"echo"`），不需要知道它在哪个 server、原始叫什么。Manager 自动完成从注册名到 server+原始名的映射。
+
+#### 9.16.4 工具名冲突处理：uniqueToolNameLocked
+
+```go
+func (m *Manager) uniqueToolNameLocked(serverName, toolName string) string {
+    // 第一优先级：直接用工具原名
+    base := sanitizeToolName(toolName)
+    if _, exists := m.bindings[base]; !exists {
+        return base  // "echo" 没被占用，直接用
+    }
+
+    // 第二优先级：server__tool 格式
+    prefixed := sanitizeToolName(serverName + "__" + toolName)
+    if _, exists := m.bindings[prefixed]; !exists {
+        return prefixed  // "beta__echo" 没被占用
+    }
+
+    // 第三优先级：server__tool_N 格式（几乎不会发生，但做了兜底）
+    for i := 2; ; i++ {
+        candidate := fmt.Sprintf("%s_%d", prefixed, i)
+        if _, exists := m.bindings[candidate]; !exists {
+            return candidate  // "beta__echo_2"
+        }
+    }
+}
+```
+
+**冲突场景举例**：
+
+```
+连接 server "alpha"（有 echo 工具）:
+  → echo 没冲突 → 注册为 "echo"
+
+连接 server "beta"（也有 echo 工具）:
+  → echo 已存在→ "beta__echo" → 注册为 "beta__echo"
+
+连接 server "beta_v2"（也有 echo 工具）:
+  → echo 已存在
+  → "beta_v2__echo" 没冲突 → 注册为 "beta_v2__echo"
+  
+三者不冲突，都能正确路由。
+```
+
+**测试验证（TestManagerToolNameCollision）**：
+```go
+mgr.Connect("alpha", cfg)  // alpha 的 echo → "echo"
+mgr.Connect("beta", cfg)   // beta 的 echo → "beta__echo"
+// 验证两个名字都存在且都能正确调用
+mgr.CallRegisteredTool("echo", ...)         // → alpha 的 echo
+mgr.CallRegisteredTool("beta__echo", ...)   // → beta 的 echo
+```
+
+### 9.17 完整调用链：从 LLM 的 tool_call 到 MCP Server
+
+这是本章最重要的部分——理解 MCP 工具是如何"伪装"成跟内置工具一样的。
+
+#### 9.17.1 第一步：TUI 启动时注册 MCP 工具
+
+```go
+// tui.go → connectMCPServers()
+for name, cfg := range m.appConfig.MCPServers {
+    go func(sName string, sCfg types.MCPConfig) {
+        // ① 连接 MCP Server（内部完成 initialize + tools/list）
+        m.mcpMgr.Connect(sName, sCfg)
+
+        // ② 把每个 MCP 工具注册到 Tool Registry
+        for _, t := range m.mcpMgr.GetAllTools() {
+            // 跳过和内置工具重名的（内置优先级更高）
+            if _, ok := m.toolRegistry.Get(t.Name); ok { continue }
+
+            toolName := t.Name  // ← 闭包捕获！
+            m.toolRegistry.Register(&types.RegisteredTool{
+                // Definition: 和内置工具一样的格式，LLM 看不出区别
+                Definition: toolpkg.BuildToolDef(t.Name, t.Description, t.InputSchema),
+                // Executor: 闭包捕获 toolName，调用时转发到 MCP Manager
+                Executor: func(ctx types.ToolContext, input map[string]any) (string, error) {
+                    return m.mcpMgr.CallRegisteredTool(toolName, input)
+                },
+                RequiresApproval: true,
+                RiskLevel:        "mcp",
+            })
+        }
+    }(serverName, serverCfg)
+}
+```
+
+**关键理解：闭包的作用**。`toolName := t.Name` 必须在循环内部重新赋值——Go 的 `for range` 循环变量会被复用。如果不复制，所有闭包都会引用同一个 `t`，最终都指向最后一个工具。
+
+#### 9.17.2 第二步：Agent Loop 中的统一调用
+
+回到第 5 章的 Agent Loop：
+
+```go
+// agent.go → agentLoop()
+for _, tc := range result.ToolCalls {
+    funcName := tc.Function.Name  // 可能是 "read_file"（内置）或 "echo"（MCP）
+
+    // 权限审批（MCP 工具因为 RiskLevel 是 "mcp"，需要审批）
+    if a.registry.RequiresApproval(funcName) {
+        if !a.requestApproval(tc) { ... }
+    }
+
+    // 解析参数
+    var params map[string]any
+    json.Unmarshal([]byte(tc.Function.Arguments), &params)
+
+    // ★ 关键：Registry.Execute 对内置工具和 MCP 工具一视同仁
+    ctx := types.ToolContext{WorkDir: a.cfg.WorkDir}
+    output, err := a.registry.Execute(funcName, ctx, params)
+    // 如果是 "read_file" → 执行内置的 GO 函数
+    // 如果是 "echo"     → 执行 MCP 闭包 → Manager.CallRegisteredTool → Client.CallTool → MCP Server
+}
+```
+
+**这就是统一接口的威力**——Agent Loop 不需要知道 `read_file` 是内置的而 `echo` 是 MCP 的。它只调用 `registry.Execute(name, ctx, params)`，Registry 负责找到正确的 Executor。
+
+#### 9.17.3 完整调用链路图
+
+```
+用户: "用 echo 工具回显 hello world"
+  │
+  ▼
+Agent Loop → LLM: [...messages..., tools=[read_file, write_file, ..., echo, get_time]]
+  │            ↑ LLM 看到的 tools 列表里，echo 和 read_file 没有任何区别
+  ▼
+LLM → Agent: tool_call { name: "echo", arguments: {"message":"hello world"} }
+  │
+  ▼
+Agent: registry.Execute("echo", ctx, {"message":"hello world"})
+  │
+  ▼
+Registry: t.Executor(ctx, input)
+  │        ↑ 这个 Executor 是 TUI 注册时的闭包
+  │
+  ▼
+闭包: m.mcpMgr.CallRegisteredTool("echo", {"message":"hello world"})
+  │
+  ▼
+Manager.CallRegisteredTool("echo", args)
+  │
+  ▼
+Manager.CallTool("", "echo", args)
+  │  ├─ bindings["echo"] → {ServerName:"test-srv", OriginalName:"echo"}
+  │  └─ clients["test-srv"] → Client{...}
+  │
+  ▼
+Client.CallTool("echo", {"message":"hello world"})
+  │
+  ▼
+Client.sendRequest("tools/call", {name:"echo", arguments:{...}})
+  │
+  ▼ (stdio 模式)
+stdioCall: pending[3] = ch → stdin.Write(json) → select{ch, timeout, ...}
+  │
+  ▼
+readLoop: stdout 读到 ─→ json.Unmarshal ─→ pending[3] ← resp ─→ ch <- resp
+  │
+  ▼
+CallTool: 解析 content，提取 text，返回 "ECHO: hello world"
+  │
+  ▼
+Registry.Execute 返回 ("ECHO: hello world", nil)
+  │
+  ▼
+Agent: 追加 tool 消息 {Role:"tool", Content:"ECHO: hello world"}
+  │
+  ▼
+Agent Loop 下一轮 → LLM 看到 tool_result → 生成回复给用户
+```
+
+**整个链路经过了 7 层**：Agent → Registry → Executor闭包 → Manager → Client → JSON-RPC → MCP Server。但 Agent Loop 只感知到第一层——这就是分层架构的价值。
+
+### 9.18 面试高频追问
+
+**Q: MCP 工具是怎么跟内置工具统一调用的？**
+
+> MCP 工具通过 Tool Registry 和内置工具使用完全一样的注册和执行接口。TUI 在连接 MCP Server 后，把每个 MCP 工具包装成一个 `RegisteredTool`，Definition 用 MCP 返回的 JSON Schema，Executor 是一个闭包——调用 `Manager.CallRegisteredTool(toolName, args)`。Registry.Execute 不区分内置还是 MCP——它只通过名字找 Executor，找到后执行。Agent Loop 完全不知道也不关心某个工具是内置的还是远程的。
+
+**Q: stdio 模式的并发模型是怎样的？**
+
+> 有一个后台 readLoop goroutine 持续从 stdout 读 JSON-RPC 响应。每次发请求时，用 `pending map[int]chan` 注册一个等待通道（key 是请求 ID），然后写 stdin。readLoop 收到响应后按 ID 投递到对应通道。用 `sync.Mutex` 保护 stdin 写入，用 `atomic.Int64` 生成递增 ID。
+
+**Q: 如果一个 MCP Server 挂了怎么办？**
+
+> 三步：readLoop 读 stdout 时发现管道关闭 → 向 `readErr` 通道发送错误 → 所有等待中的 `stdioCall` 收到 readErr 并返回错误 → Agent 把错误信息作为 tool_result 返回给 LLM → LLM 知道工具不可用，尝试其他方案。不会崩溃。
+
+**Q: GoCoder 怎么处理 MCP Server 在响应前发通知的情况？**
+
+> readLoop 中过滤 `resp.ID == 0` 的响应。JSON-RPC 通知没有 id 字段，反序列化后 ID 是零值。跳过它们，不会被误配到某个等待的请求。这一点在 `TestStdioSkipsNotificationBeforeResponse` 中有测试——构造一个在 tools/list 响应前发 progress 通知的 server，验证 GoCoder 能正确拿到工具列表。
 
 ---
+
+> **本章小结**：MCP 模块的核心设计可以总结为三点：
+> 1. **Client 层**处理单 server 的 JSON-RPC 通信，stdio 用 Pending Map + Channel 匹配，HTTP 用 URL 回退
+> 2. **Manager 层**管理多 server，用 ToolBinding 做注册名→来源映射，解决命名冲突
+> 3. **TUI 层**通过闭包 Executor 把 MCP 工具注册进 Tool Registry，实现和内置工具统一的调用接口
+>
+> 这约 650 行代码是一个完整的"从协议到工具注册"的实现，可以作为理解 MCP 客户端的参考实现。
 
 ## <a id="第10章"></a>第 10 章：Skills 系统——教 AI 怎么做事
 
